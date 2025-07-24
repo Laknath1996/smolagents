@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import inspect
 import json
 import os
 import re
@@ -28,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Type, TypeAlias, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypedDict, Union
 
 import jinja2
 import yaml
@@ -51,12 +52,11 @@ from .local_python_executor import BASE_BUILTIN_MODULES, LocalPythonExecutor, Py
 from .memory import (
     ActionStep,
     AgentMemory,
-    CallbackRegistry,
     FinalAnswerStep,
-    MemoryStep,
     PlanningStep,
     SystemPromptStep,
     TaskStep,
+    SummaryStep,
     Timing,
     TokenUsage,
     ToolCall,
@@ -70,6 +70,7 @@ from .models import (
     Model,
     agglomerate_stream_deltas,
     parse_json_if_needed,
+    get_clean_message_list
 )
 from .monitoring import (
     YELLOW_HEX,
@@ -77,8 +78,8 @@ from .monitoring import (
     LogLevel,
     Monitor,
 )
-from .remote_executors import DockerExecutor, E2BExecutor, WasmExecutor
-from .tools import BaseTool, Tool, validate_tool_arguments
+from .remote_executors import DockerExecutor, E2BExecutor
+from .tools import Tool, validate_tool_arguments
 from .utils import (
     AGENT_GRADIO_APP_TEMPLATE,
     AgentError,
@@ -214,6 +215,8 @@ class RunResult:
     messages: list[dict]
     token_usage: TokenUsage | None
     timing: Timing
+    num_total_steps: int
+    stepwise_token_usage: list[list[int, int, int]] | None = None
 
 
 StreamEvent: TypeAlias = Union[
@@ -227,6 +230,12 @@ StreamEvent: TypeAlias = Union[
     FinalAnswerStep,
 ]
 
+@dataclass
+class RecomposeArgs:
+    recompose: bool = False
+    type: Literal["manual", "auto"] = "manual"
+    freq: int = 4
+    tokens: int = 20000
 
 class MultiStepAgent(ABC):
     """
@@ -246,7 +255,7 @@ class MultiStepAgent(ABC):
             Parameter `grammar` is deprecated and will be removed in version 1.20.
             </Deprecated>
         managed_agents (`list`, *optional*): Managed agents that the agent can call.
-        step_callbacks (`list[Callable]` | `dict[Type[MemoryStep], Callable | list[Callable]]`, *optional*): Callbacks that will be called at each step.
+        step_callbacks (`list[Callable]`, *optional*): Callbacks that will be called at each step.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
         name (`str`, *optional*): Necessary for a managed agent only - the name by which this agent can be called.
         description (`str`, *optional*): Necessary for a managed agent only - the description of this agent.
@@ -262,13 +271,14 @@ class MultiStepAgent(ABC):
         tools: list[Tool],
         model: Model,
         prompt_templates: PromptTemplates | None = None,
+        recompose_args: RecomposeArgs | None = None,
         instructions: str | None = None,
         max_steps: int = 20,
         add_base_tools: bool = False,
         verbosity_level: LogLevel = LogLevel.INFO,
         grammar: dict[str, str] | None = None,
         managed_agents: list | None = None,
-        step_callbacks: list[Callable] | dict[Type[MemoryStep], Callable | list[Callable]] | None = None,
+        step_callbacks: list[Callable] | None = None,
         planning_interval: int | None = None,
         name: str | None = None,
         description: str | None = None,
@@ -280,6 +290,7 @@ class MultiStepAgent(ABC):
         self.agent_name = self.__class__.__name__
         self.model = model
         self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES
+        self.recompose_args = recompose_args or RecomposeArgs()
         if prompt_templates is not None:
             missing_keys = set(EMPTY_PROMPT_TEMPLATES.keys()) - set(prompt_templates.keys())
             assert not missing_keys, (
@@ -314,6 +325,7 @@ class MultiStepAgent(ABC):
 
         self.task: str | None = None
         self.memory = AgentMemory(self.system_prompt)
+        self.event_stream = AgentMemory(self.system_prompt)
 
         if logger is None:
             self.logger = AgentLogger(level=verbosity_level)
@@ -321,7 +333,8 @@ class MultiStepAgent(ABC):
             self.logger = logger
 
         self.monitor = Monitor(self.model, self.logger)
-        self._setup_step_callbacks(step_callbacks)
+        self.step_callbacks = step_callbacks if step_callbacks is not None else []
+        self.step_callbacks.append(self.monitor.update_metrics)
         self.stream_outputs = False
 
     @property
@@ -344,6 +357,7 @@ class MultiStepAgent(ABC):
         self.managed_agents = {}
         if managed_agents:
             assert all(agent.name and agent.description for agent in managed_agents), (
+    
                 "All managed agents need both a name and a description!"
             )
             self.managed_agents = {agent.name: agent for agent in managed_agents}
@@ -359,9 +373,7 @@ class MultiStepAgent(ABC):
                 agent.output_type = "string"
 
     def _setup_tools(self, tools, add_base_tools):
-        assert all(isinstance(tool, BaseTool) for tool in tools), (
-            "All elements must be instance of BaseTool (or a subclass)"
-        )
+        assert all(isinstance(tool, Tool) for tool in tools), "All elements must be instance of Tool (or a subclass)"
         self.tools = {tool.name: tool for tool in tools}
         if add_base_tools:
             self.tools.update(
@@ -384,26 +396,6 @@ class MultiStepAgent(ABC):
                 "Each tool or managed_agent should have a unique name! You passed these duplicate names: "
                 f"{[name for name in tool_and_managed_agent_names if tool_and_managed_agent_names.count(name) > 1]}"
             )
-
-    def _setup_step_callbacks(self, step_callbacks):
-        # Initialize step callbacks registry
-        self.step_callbacks = CallbackRegistry()
-        if step_callbacks:
-            # Register callbacks list only for ActionStep for backward compatibility
-            if isinstance(step_callbacks, list):
-                for callback in step_callbacks:
-                    self.step_callbacks.register(ActionStep, callback)
-            # Register callbacks dict for specific step classes
-            elif isinstance(step_callbacks, dict):
-                for step_cls, callbacks in step_callbacks.items():
-                    if not isinstance(callbacks, list):
-                        callbacks = [callbacks]
-                    for callback in callbacks:
-                        self.step_callbacks.register(step_cls, callback)
-            else:
-                raise ValueError("step_callbacks must be a list or a dict")
-        # Register monitor update_metrics only for ActionStep for backward compatibility
-        self.step_callbacks.register(ActionStep, self.monitor.update_metrics)
 
     def run(
         self,
@@ -437,15 +429,17 @@ class MultiStepAgent(ABC):
         max_steps = max_steps or self.max_steps
         self.task = task
         self.interrupt_switch = False
-        if additional_args:
+        if additional_args is not None:
             self.state.update(additional_args)
             self.task += f"""
-You have been provided with these additional arguments, that you can access directly using the keys as variables:
+You have been provided with these additional arguments, that you can access using the keys as variables in your python code:
 {str(additional_args)}."""
 
         self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
+        self.event_stream.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
         if reset:
             self.memory.reset()
+            self.event_stream.reset()
             self.monitor.reset()
 
         self.logger.log_task(
@@ -455,6 +449,11 @@ You have been provided with these additional arguments, that you can access dire
             title=self.name if hasattr(self, "name") else None,
         )
         self.memory.steps.append(TaskStep(task=self.task, task_images=images))
+        self.event_stream.steps.append(TaskStep(task=self.task, task_images=images))
+
+        if self.recompose_args.recompose:
+            self.memory.steps.append(SummaryStep(summary="No progress yet."))
+            self.event_stream.steps.append(SummaryStep(summary="No progress yet."))
 
         if getattr(self, "python_executor", None):
             self.python_executor.send_variables(variables=self.state)
@@ -494,21 +493,55 @@ You have been provided with these additional arguments, that you can access dire
 
             messages = self.memory.get_full_steps()
 
+            stepwise_token_usage = []
+            for step in self.event_stream.steps:
+                if isinstance(step, ActionStep):
+                    stepwise_token_usage.append([step.step_number, step.token_usage.input_tokens, step.token_usage.output_tokens])                
+
             return RunResult(
                 output=output,
                 token_usage=token_usage,
                 messages=messages,
                 timing=Timing(start_time=run_start_time, end_time=time.time()),
                 state=state,
+                num_total_steps=len(steps),
+                stepwise_token_usage=stepwise_token_usage,
             )
 
         return output
 
+    def recompose(self, trace):
+        """
+        
+        TODO: Add in-context examples
+        
+
+        """
+
+        recompose_message = ChatMessage(
+            role=MessageRole.USER,
+            content=[
+                {
+                    "type": "text",
+                    "text": populate_template(
+                        self.prompt_templates["recompose_prompt"], variables={"task": self.task, "trace": get_clean_message_list(trace[1:])}
+                    )
+                }
+                ]
+        )
+
+        chat_message = self.model.generate([recompose_message])
+        return chat_message.content
+
     def _run_stream(
         self, task: str, max_steps: int, images: list["PIL.Image.Image"] | None = None
     ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta]:
+        
         self.step_number = 1
         returned_final_answer = False
+        current_num_input_tokens = 0
+        recompose_now = False
+
         while not returned_final_answer and self.step_number <= max_steps:
             if self.interrupt_switch:
                 raise AgentError("Agent interrupted.", self.logger)
@@ -525,14 +558,39 @@ You have been provided with these additional arguments, that you can access dire
                     yield element
                     planning_step = element
                 assert isinstance(planning_step, PlanningStep)  # Last yielded element should be a PlanningStep
+                self.memory.steps.append(planning_step)
                 planning_end_time = time.time()
                 planning_step.timing = Timing(
                     start_time=planning_start_time,
                     end_time=planning_end_time,
                 )
-                self._finalize_step(planning_step)
-                self.memory.steps.append(planning_step)
 
+            if self.recompose_args.recompose:
+                if isinstance(self.memory.steps[-1], ActionStep):
+                    current_num_input_tokens = self.memory.steps[-1].token_usage.input_tokens 
+
+                if self.recompose_args.type == "manual-freq" and self.step_number % self.recompose_args.freq == 0:
+                    recompose_now = True
+                
+                elif self.recompose_args.type == "manual-tokens" and current_num_input_tokens >= self.recompose_args.tokens:
+                    recompose_now = True
+
+                elif self.recompose_args.type == "auto" and self.step_number % self.recompose_args.freq == 0:
+                    raise NotImplementedError
+                
+                else:
+                    recompose_now = False
+
+                if recompose_now:
+                    current_trace = self.write_memory_to_messages()[1:]
+                    summary = self.recompose(current_trace)
+                    self.memory.reset()
+                    self.memory.steps.append(TaskStep(task=task))
+                    self.memory.steps.append(SummaryStep(summary=summary))
+                    self.event_stream.steps.append(SummaryStep(summary=summary))
+                    recompose_now = False
+
+            
             # Start action step!
             action_step_start_time = time.time()
             action_step = ActionStep(
@@ -567,6 +625,7 @@ You have been provided with these additional arguments, that you can access dire
             finally:
                 self._finalize_step(action_step)
                 self.memory.steps.append(action_step)
+                self.event_stream.steps.append(action_step) 
                 yield action_step
                 self.step_number += 1
 
@@ -582,9 +641,13 @@ You have been provided with these additional arguments, that you can access dire
             except Exception as e:
                 raise AgentError(f"Check {check_function.__name__} failed with error: {e}", self.logger)
 
-    def _finalize_step(self, memory_step: ActionStep | PlanningStep):
+    def _finalize_step(self, memory_step: ActionStep):
         memory_step.timing.end_time = time.time()
-        self.step_callbacks.callback(memory_step, agent=self)
+        for callback in self.step_callbacks:
+            # For compatibility with old callbacks that don't take the agent as an argument
+            callback(memory_step) if len(inspect.signature(callback).parameters) == 1 else callback(
+                memory_step, agent=self
+            )
 
     def _handle_max_steps_reached(self, task: str, images: list["PIL.Image.Image"]) -> Any:
         action_step_start_time = time.time()
@@ -598,6 +661,7 @@ You have been provided with these additional arguments, that you can access dire
         final_memory_step.action_output = final_answer.content
         self._finalize_step(final_memory_step)
         self.memory.steps.append(final_memory_step)
+        self.event_stream.steps.append(final_memory_step)
         return final_answer.content
 
     def _generate_planning_step(
@@ -745,6 +809,18 @@ You have been provided with these additional arguments, that you can access dire
             messages.extend(memory_step.to_messages(summary_mode=summary_mode))
         return messages
 
+    def write_events_to_messages(
+        self,
+        summary_mode: bool = False,
+    ) -> list[ChatMessage]:
+        """
+        Reads past llm_outputs, actions, and observations or errors from the memory into a series of messages
+        """
+        messages = self.event_stream.system_prompt.to_messages(summary_mode=summary_mode)
+        for memory_step in self.event_stream.steps:
+            messages.extend(memory_step.to_messages(summary_mode=summary_mode))
+        return messages
+
     def _step_stream(
         self, memory_step: ActionStep
     ) -> Generator[ChatMessageStreamDelta | ToolCall | ToolOutput | ActionOutput]:
@@ -825,10 +901,7 @@ You have been provided with these additional arguments, that you can access dire
             chat_message: ChatMessage = self.model.generate(messages)
             return chat_message
         except Exception as e:
-            return ChatMessage(
-                role=MessageRole.ASSISTANT,
-                content=[{"type": "text", "text": f"Error in generating final LLM output: {e}"}],
-            )
+            return ChatMessage(role=MessageRole.ASSISTANT, content=f"Error in generating final LLM output:\n{e}")
 
     def visualize(self):
         """Creates a rich tree visualization of the agent's structure."""
@@ -862,7 +935,7 @@ You have been provided with these additional arguments, that you can access dire
         if self.provide_run_summary:
             answer += "\n\nFor more detail, find below a summary of this agent's work:\n<summary_of_work>\n"
             for message in self.write_memory_to_messages(summary_mode=True):
-                content = message.content
+                content = message["content"]
                 answer += "\n" + truncate_content(str(content)) + "\n---"
             answer += "\n</summary_of_work>"
         return answer
@@ -1473,7 +1546,7 @@ class CodeAgent(MultiStepAgent):
         prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
-        executor_type (`Literal["local", "e2b", "docker", "wasm"]`, default `"local"`): Type of code executor.
+        executor_type (`str`, default `"local"`): Which executor type to use between `"local"`, `"e2b"`, or `"docker"`.
         executor_kwargs (`dict`, *optional*): Additional arguments to pass to initialize the executor.
         max_print_outputs_length (`int`, *optional*): Maximum length of the print outputs.
         stream_outputs (`bool`, *optional*, default `False`): Whether to stream outputs during execution.
@@ -1484,7 +1557,6 @@ class CodeAgent(MultiStepAgent):
             <Deprecated version="1.17.0">
             Parameter `grammar` is deprecated and will be removed in version 1.20.
             </Deprecated>
-        code_block_tags (`tuple[str, str]` | `Literal["markdown"]`, *optional*): Opening and closing tags for code blocks (regex strings). Pass a custom tuple, or pass 'markdown' to use ("```(?:python|py)", "\\n```"), leave empty to use ("<code>", "</code>").
         **kwargs: Additional keyword arguments.
     """
 
@@ -1495,13 +1567,12 @@ class CodeAgent(MultiStepAgent):
         prompt_templates: PromptTemplates | None = None,
         additional_authorized_imports: list[str] | None = None,
         planning_interval: int | None = None,
-        executor_type: Literal["local", "e2b", "docker", "wasm"] = "local",
+        executor_type: str | None = "local",
         executor_kwargs: dict[str, Any] | None = None,
         max_print_outputs_length: int | None = None,
         stream_outputs: bool = False,
         use_structured_outputs_internally: bool = False,
         grammar: dict[str, str] | None = None,
-        code_block_tags: str | tuple[str, str] | None = None,
         **kwargs,
     ):
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
@@ -1514,21 +1585,10 @@ class CodeAgent(MultiStepAgent):
             )
         else:
             prompt_templates = prompt_templates or yaml.safe_load(
-                importlib.resources.files("smolagents.prompts").joinpath("code_agent.yaml").read_text()
+                importlib.resources.files("smolagents.prompts").joinpath("code_agent_ashwin.yaml").read_text()
             )
         if grammar and use_structured_outputs_internally:
             raise ValueError("You cannot use 'grammar' and 'use_structured_outputs_internally' at the same time.")
-
-        if isinstance(code_block_tags, str) and not code_block_tags == "markdown":
-            raise ValueError("Only 'markdown' is supported for a string argument to `code_block_tags`.")
-        self.code_block_tags = (
-            code_block_tags
-            if isinstance(code_block_tags, tuple)
-            else ("```python", "```")
-            if code_block_tags == "markdown"
-            else ("<code>", "</code>")
-        )
-
         super().__init__(
             tools=tools,
             model=model,
@@ -1547,10 +1607,8 @@ class CodeAgent(MultiStepAgent):
                 "Caution: you set an authorization for all imports, meaning your agent can decide to import any package it deems necessary. This might raise issues if the package is not installed in your environment.",
                 level=LogLevel.INFO,
             )
-        if executor_type not in {"local", "e2b", "docker", "wasm"}:
-            raise ValueError(f"Unsupported executor type: {executor_type}")
-        self.executor_type = executor_type
-        self.executor_kwargs: dict[str, Any] = executor_kwargs or {}
+        self.executor_type = executor_type or "local"
+        self.executor_kwargs = executor_kwargs or {}
         self.python_executor = self.create_python_executor()
 
     def __enter__(self):
@@ -1565,22 +1623,21 @@ class CodeAgent(MultiStepAgent):
             self.python_executor.cleanup()
 
     def create_python_executor(self) -> PythonExecutor:
-        if self.executor_type == "local":
-            return LocalPythonExecutor(
-                self.additional_authorized_imports,
-                **{"max_print_outputs_length": self.max_print_outputs_length} | self.executor_kwargs,
-            )
-        else:
-            if self.managed_agents:
-                raise Exception("Managed agents are not yet supported with remote code execution.")
-            remote_executors = {
-                "e2b": E2BExecutor,
-                "docker": DockerExecutor,
-                "wasm": WasmExecutor,
-            }
-            return remote_executors[self.executor_type](
-                self.additional_authorized_imports, self.logger, **self.executor_kwargs
-            )
+        match self.executor_type:
+            case "e2b" | "docker":
+                if self.managed_agents:
+                    raise Exception("Managed agents are not yet supported with remote code execution.")
+                if self.executor_type == "e2b":
+                    return E2BExecutor(self.additional_authorized_imports, self.logger, **self.executor_kwargs)
+                else:
+                    return DockerExecutor(self.additional_authorized_imports, self.logger, **self.executor_kwargs)
+            case "local":
+                return LocalPythonExecutor(
+                    self.additional_authorized_imports,
+                    **{"max_print_outputs_length": self.max_print_outputs_length} | self.executor_kwargs,
+                )
+            case _:  # if applicable
+                raise ValueError(f"Unsupported executor type: {self.executor_type}")
 
     def initialize_system_prompt(self) -> str:
         system_prompt = populate_template(
@@ -1594,8 +1651,6 @@ class CodeAgent(MultiStepAgent):
                     else str(self.authorized_imports)
                 ),
                 "custom_instructions": self.instructions,
-                "code_block_opening_tag": self.code_block_tags[0],
-                "code_block_closing_tag": self.code_block_tags[1],
             },
         )
         return system_prompt
@@ -1613,10 +1668,6 @@ class CodeAgent(MultiStepAgent):
         input_messages = memory_messages.copy()
         ### Generate model output ###
         memory_step.model_input_messages = input_messages
-        stop_sequences = ["Observation:", "Calling tools:"]
-        if self.code_block_tags[1] not in self.code_block_tags[0]:
-            # If the closing tag is contained in the opening tag, adding it as a stop sequence would cut short any code generation
-            stop_sequences.append(self.code_block_tags[1])
         try:
             additional_args: dict[str, Any] = {}
             if self.grammar:
@@ -1626,7 +1677,7 @@ class CodeAgent(MultiStepAgent):
             if self.stream_outputs:
                 output_stream = self.model.generate_stream(
                     input_messages,
-                    stop_sequences=stop_sequences,
+                    stop_sequences=["<end_code>", "Observation:", "Calling tools:"],
                     **additional_args,
                 )
                 chat_message_stream_deltas: list[ChatMessageStreamDelta] = []
@@ -1643,9 +1694,9 @@ class CodeAgent(MultiStepAgent):
             else:
                 chat_message: ChatMessage = self.model.generate(
                     input_messages,
-                    stop_sequences=stop_sequences,
+                    stop_sequences=["<end_code>", "Observation:", "Calling tools:"],
                     **additional_args,
-                )
+                )                
                 memory_step.model_output_message = chat_message
                 output_text = chat_message.content
                 self.logger.log_markdown(
@@ -1654,10 +1705,10 @@ class CodeAgent(MultiStepAgent):
                     level=LogLevel.DEBUG,
                 )
 
-            # This adds the end code sequence to the history.
-            # This will nudge ulterior LLM calls to finish with this end code sequence, thus efficiently stopping generation.
-            if output_text and not output_text.strip().endswith(self.code_block_tags[1]):
-                output_text += self.code_block_tags[1]
+            # This adds <end_code> sequence to the history.
+            # This will nudge ulterior LLM calls to finish with <end_code>, thus efficiently stopping generation.
+            if output_text and output_text.strip().endswith("```"):
+                output_text += "<end_code>"
                 memory_step.model_output_message.content = output_text
 
             memory_step.token_usage = chat_message.token_usage
@@ -1669,9 +1720,9 @@ class CodeAgent(MultiStepAgent):
         try:
             if self._use_structured_outputs_internally:
                 code_action = json.loads(output_text)["code"]
-                code_action = extract_code_from_text(code_action, self.code_block_tags) or code_action
+                code_action = extract_code_from_text(code_action) or code_action
             else:
-                code_action = parse_code_blobs(output_text, self.code_block_tags)
+                code_action = parse_code_blobs(output_text)
             code_action = fix_final_answer_code(code_action)
             memory_step.code_action = code_action
         except Exception as e:
@@ -1759,7 +1810,6 @@ class CodeAgent(MultiStepAgent):
             "executor_type": agent_dict.get("executor_type"),
             "executor_kwargs": agent_dict.get("executor_kwargs"),
             "max_print_outputs_length": agent_dict.get("max_print_outputs_length"),
-            "code_block_tags": agent_dict.get("code_block_tags"),
         }
         # Filter out None values
         code_agent_kwargs = {k: v for k, v in code_agent_kwargs.items() if v is not None}

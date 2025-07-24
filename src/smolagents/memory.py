@@ -1,7 +1,6 @@
-import inspect
 from dataclasses import asdict, dataclass
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Callable, Type
+from typing import TYPE_CHECKING, Any
 
 from smolagents.models import ChatMessage, MessageRole
 from smolagents.monitoring import AgentLogger, LogLevel, Timing, TokenUsage
@@ -13,9 +12,6 @@ if TYPE_CHECKING:
 
     from smolagents.models import ChatMessage
     from smolagents.monitoring import AgentLogger
-
-
-__all__ = ["AgentMemory"]
 
 
 logger = getLogger(__name__)
@@ -175,6 +171,20 @@ class TaskStep(MemoryStep):
             content.extend([{"type": "image", "image": image} for image in self.task_images])
 
         return [ChatMessage(role=MessageRole.USER, content=content)]
+    
+
+@dataclass
+class SummaryStep(MemoryStep):
+    summary: str
+    task_images: list["PIL.Image.Image"] | None = None
+
+    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+        content = [{"type": "text", "text": f"Summary of the ASSISTANT's progress so far:\n{self.summary}\n\nBased on this summary, you should now either proceed with solving the task or provide the final answer."}]
+        if self.task_images:
+            for image in self.task_images:
+                content.append({"type": "image", "image": image})
+
+        return [ChatMessage(role=MessageRole.USER, content=content)]
 
 
 @dataclass
@@ -188,7 +198,7 @@ class SystemPromptStep(MemoryStep):
 
 
 @dataclass
-class FinalAnswerStep(MemoryStep):
+class  FinalAnswerStep(MemoryStep):
     output: Any
 
 
@@ -258,40 +268,4 @@ class AgentMemory:
         )
 
 
-class CallbackRegistry:
-    """Registry for callbacks that are called at each step of the agent's execution.
-
-    Callbacks are registered by passing a step class and a callback function.
-    """
-
-    def __init__(self):
-        self._callbacks: dict[Type[MemoryStep], list[Callable]] = {}
-
-    def register(self, step_cls: Type[MemoryStep], callback: Callable):
-        """Register a callback for a step class.
-
-        Args:
-            step_cls (Type[MemoryStep]): Step class to register the callback for.
-            callback (Callable): Callback function to register.
-        """
-        if step_cls not in self._callbacks:
-            self._callbacks[step_cls] = []
-        self._callbacks[step_cls].append(callback)
-
-    def callback(self, memory_step, **kwargs):
-        """Call callbacks registered for a step type.
-
-        Args:
-            memory_step (MemoryStep): Step to call the callbacks for.
-            **kwargs: Additional arguments to pass to callbacks that accept them.
-                Typically, includes the agent instance.
-
-        Notes:
-            For backwards compatibility, callbacks with a single parameter signature
-            receive only the memory_step, while callbacks with multiple parameters
-            receive both the memory_step and any additional kwargs.
-        """
-        # For compatibility with old callbacks that only take the step as an argument
-        for cls in memory_step.__class__.__mro__:
-            for cb in self._callbacks.get(cls, []):
-                cb(memory_step) if len(inspect.signature(cb).parameters) == 1 else cb(memory_step, **kwargs)
+__all__ = ["AgentMemory"]

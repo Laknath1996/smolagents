@@ -328,5 +328,24 @@ final_answer:
   pre_messages: |-
     An agent tried to answer a user query but it got stuck and failed to do so. You are tasked with providing an answer instead. Here is the agent's memory:
   post_messages: |-
-    Based on the above, please provide an answer to the following user task
-    {{task}}
+    Based on the above, provide a single-word final answer to the task above. DO NOT PROVIDE code, explanations, reasoning, and steps. Only provide the final answer in a single word.
+recompose_prompt: |-
+  You are given a partial reasoning trace that outlines the steps taken so far toward answering a question.
+  Your task is to output a short summary of your own progress up to this point.
+  Write in the first person, as if you are explaining what you have done so far.
+  Focus on the key steps you've taken, the discoveries you have made, and any intermediate insights.
+  You may choose to retain useful code snippets or intermediate results that can be helpful for the next steps.
+  Preserve the details of the plan you were going to follow. 
+  When summarizing, consider all the thoughts, tool-calls, and tool-responses included in the trace.
+  Include any important lessons you learned from the error messages within tool-responses, if any.
+  Do not guess the final answer or go beyond the information you've already found.
+  After you summarize your progress so far, you will lose access to the reasoning trace and will have to continue solving the task based on the summary you output.
+  Therefore, make sure to include all the relevant information in your summary and discard any unnecessary details.
+
+  Here is the task you were trying to solve:
+  {{task}}
+
+  Here is the reasoning trace you have so far:
+  {{trace}}
+
+  Now summarize your progress!
